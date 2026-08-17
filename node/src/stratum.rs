@@ -232,6 +232,8 @@ pub struct DownstreamClient {
     pub extranonce2_prefix: Option<Vec<u8>>,
     /// The size of extranonce2 that the miner rolls, after prefix is subtracted
     pub miner_extranonce2_size: usize,
+    /// Minimum share difficulty for this connection; miner-suggested values are clamped to this.
+    pub minimum_difficulty: u64,
     /// Optional per-connection monitoring target (stricter than share/weak target).
     /// Used to sample miner health at a higher rate than the share target.
     pub monitor_target: Option<bitcoin::Target>,
@@ -1505,10 +1507,11 @@ impl DownstreamClient {
                     method: "mining.set_difficulty".to_string(),
                 })?;
             self.suggest_difficulty_done = true;
+            let clamped = difficulty_u64.max(self.minimum_difficulty);
             Ok(StratumResponses::SuggestDifficultyResponse {
                 suggest_difficulty_resp: SuggestDifficultyResponse {
                     method: "mining.set_difficulty".to_string(),
-                    params: vec![difficulty_u64],
+                    params: vec![clamped],
                 },
             })
         } else {
@@ -1908,6 +1911,7 @@ impl Default for DownstreamClient {
             extranonce2_len: EXTRANONCE2_SIZE,
             extranonce2_prefix: None,
             miner_extranonce2_size: EXTRANONCE2_SIZE,
+            minimum_difficulty: 1,
             monitor_target: None,
             block_submission_tx: None,
             is_proxy_mode: false,
@@ -3572,6 +3576,7 @@ impl Server {
                                 extranonce2_len: assigned_extranonce2_size,
                                 extranonce2_prefix: extranonce2_prefix,
                                 miner_extranonce2_size: assigned_extranonce2_size,
+                                minimum_difficulty: self.stratum_config.minimum_difficulty,
                                 monitor_target: None,
                                 block_submission_tx: self.block_submission_tx.clone(),
                                 is_proxy_mode: is_proxy,

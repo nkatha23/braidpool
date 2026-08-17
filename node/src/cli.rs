@@ -97,6 +97,14 @@ pub struct Cli {
     /// Weak difficulty for the miner in audit mode
     #[arg(long)]
     pub miner_difficulty: Option<f64>,
+
+    /// Initial share difficulty assigned to new stratum connections.
+    #[arg(long, default_value_t = 1)]
+    pub start_difficulty: u64,
+
+    /// Minimum share difficulty; miner-suggested values are clamped to this floor.
+    #[arg(long, default_value_t = 1)]
+    pub minimum_difficulty: u64,
 }
 
 #[cfg(test)]

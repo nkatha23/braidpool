@@ -19,6 +19,7 @@ use node::db::db_handlers::FETCH_BEAD_BATCH_SIZE;
 use node::ibd_manager::{IBD_TRIGGER_AFTER, MAX_IBD_INCOMING_THRESHOLD, MAX_IBD_RETRIES};
 use node::upstream_pool;
 use node::utils::compute_block_hash;
+use node::utils::resolve_datadir;
 use node::utils::BeadHash;
 use node::SwarmHandler;
 use node::{
@@ -31,13 +32,15 @@ use node::{
     peer_manager::PeerManager,
     rpc_server::{run_rpc_server, BitcoinRpcConfig, RpcProxyCommand},
     setup_tracing,
-    stratum::{BlockTemplate, ConnectionMapping, Notifier, NotifyCmd, Server, StratumServerConfig},
+    stratum::{
+        BlockTemplate, ConnectionMapping, GlobalJobStore, Notifier, NotifyCmd, Server,
+        StratumServerConfig,
+    },
     SwarmCommand, TemplateId,
 };
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,6 +106,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         AtomicBool::new(true)
     };
     let ibd_spinlock = Arc::new(ibd_or_not);
+
+    // Resolving datadir or the default datadir if not provided .
+    let datadir_path = resolve_datadir(&args.datadir)?;
     // Initializing the braid object with read write lock
     //for supporting concurrent readers and single writer
     let braid: Arc<RwLock<braid::Braid>> =
@@ -112,7 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if !args.audit {
         //Initializing DB and db command handler
-        let (mut db_handler, tx) = DBHandler::new(network).await.map_err(|e| {
+        let (mut db_handler, tx) = DBHandler::new(&datadir_path, network).await.map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Database initialization failed: {:?}", e),
@@ -255,12 +261,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //cloning the channel to be sent across different interfaces
     let notification_tx_clone = notification_tx.clone();
     //Connection mapping for all the downstream connection connected to the stratum server
-    // let connection_mapping = Arc::new(Mutex::new(ConnectionMapping::new()));
     let connection_mapping_for_shutdown = connection_mapping.clone();
-    //Mining job map keeping all the jobs provided to the downstream
-    let mining_job_map = Arc::new(Mutex::new(HashMap::new()));
+    //Global job store shared across all connected miners
+    let global_job_store = Arc::new(Mutex::new(GlobalJobStore::new(
+        node::GLOBAL_JOB_STORE_CAPACITY,
+    )));
     //Intializing `notifier` for mining.notify
-    let mut notifier: Notifier = Notifier::new(notification_rx, Arc::clone(&mining_job_map));
+    let mut notifier: Notifier = Notifier::new(notification_rx, Arc::clone(&global_job_store));
     //Stratum configuration initialization
     let stratum_config = StratumServerConfig::default();
     let stratum_bind_address = format!("{}:{}", stratum_config.hostname, args.stratum_port);
@@ -330,7 +337,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
 
         // Initialize audit records
-        let audit_dag = match audit::AuditDAG::new_with_db(Arc::clone(&braid)).await {
+        let audit_dag = match audit::AuditDAG::new_with_db(Arc::clone(&braid), &datadir_path).await
+        {
             Ok(dag) => Arc::new(Mutex::new(dag)),
             Err(e) => {
                 error!("Failed to initialize audit DAG with database: {}", e);
@@ -376,7 +384,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let upstream_cache = upstream_pool::UpstreamCache::new();
         let upstream_cache_clone = upstream_cache.clone();
         upstream_cache_for_notifier = Some(upstream_cache.clone());
-        let mining_job_map_for_upstream_cleanup = mining_job_map.clone();
+        let global_job_store_for_upstream_cleanup = global_job_store.clone();
         // For forwarding shares to upstream pool (stratum server -> upstream client), using Arc<Mutex<Receiver>> so the receiver survives reconnections,
         // Buffer 50,000 shares to survive upstream lag spikes without blocking miners
         let (upstream_share_tx, upstream_share_rx) =
@@ -735,15 +743,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             break;
                         }
                         info!("Invalidating all upstream jobs to prevent stale shares...");
-                        let global_map = mining_job_map_for_upstream_cleanup.lock().await;
-                        for miner_job_map in global_map.values() {
-                            let mut map = miner_job_map.lock().await;
-                            map.clear_upstream_jobs();
-                        }
-                        info!(
-                            "Upstream job cache cleared for {} miners.",
-                            global_map.len()
-                        );
+                        global_job_store_for_upstream_cleanup
+                            .lock()
+                            .await
+                            .clear_upstream_jobs();
+                        info!("Upstream job cache cleared.");
 
                         // Calculate backoff delay with jitter
                         let delay = std::cmp::min(
@@ -832,7 +836,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _res = stratum_server
             .run_stratum_service(
                 stratum_listener,
-                mining_job_map,
+                global_job_store,
                 notification_tx_clone,
                 swarm_handler_arc.clone(),
                 spin_lock_ref,
@@ -843,32 +847,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await;
     });
 
-    let datadir_str = args.datadir.to_str().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Invalid datadir path encoding",
-        )
-    })?;
-    let datadir = shellexpand::full(datadir_str).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Shell expansion failed: {}", e),
-        )
-    })?;
-    match fs::metadata(&*datadir) {
-        Ok(m) => {
-            if !m.is_dir() {
-                error!(datadir = %datadir, "Data directory exists but is not a directory");
-            }
-            info!(datadir = %datadir, "Using existing data directory");
-        }
-        Err(_) => {
-            info!(datadir = %datadir, "Creating data directory");
-            fs::create_dir_all(&*datadir)?;
-        }
-    }
-
-    let datadir_path = Path::new(&*datadir);
     let keystore_path = datadir_path.join("keystore");
     #[cfg(unix)]
     {
@@ -1003,6 +981,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //IPC(inter process communication) based `getblocktemplate` and `notification` to send to the downstream via the `cmempoold` architecture
     info!(socket = %args.ipc_socket, "IPC socket path");
 
+    // Set up SV2 template channel if SV2 pool port is configured
+    let sv2_template_tx = args.sv2_pool_port.map(|port| {
+        let (tx, rx) = mpsc::channel::<braidpool_common::template::BraidpoolTemplate>(32);
+        // TODO(sv2-integration/PR5): replace this drain task with the real sv2-apps pool consumer
+        tokio::spawn(async move {
+            let mut template_rx = rx;
+            while let Some(t) = template_rx.recv().await {
+                debug!(
+                    template_id = t.template_id,
+                    height = t.height,
+                    "SV2 template queued (pool wiring pending)"
+                );
+            }
+        });
+        info!(
+            port = port,
+            "SV2 pool mode enabled — template channel created"
+        );
+        tx
+    });
+
     // Spawn IPC handler
     let _ipc_handler = if !args.audit {
         Some(tokio::task::spawn_blocking(move || {
@@ -1062,6 +1061,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 &mut latest_template_merkle_branch_for_ipc.clone(),
                                 template_cache_for_consumer,
                                 latest_template_id_for_consumer,
+                                sv2_template_tx,
                             )
                             .await
                             {

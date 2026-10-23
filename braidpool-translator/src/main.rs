@@ -1,21 +1,16 @@
 mod args;
 
+use stratum_apps::config_helpers::logging::init_logging;
 use translator_sv2::TranslatorSv2;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("braidpool_translator=info".parse().unwrap())
-                .add_directive("translator_sv2=info".parse().unwrap()),
-        )
-        .init();
-
-    let config = args::load_config().unwrap_or_else(|e| {
+    let config = args::load_translator_config().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
+
+    init_logging(config.log_dir());
 
     let translator = TranslatorSv2::new(config);
 

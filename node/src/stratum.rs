@@ -2008,6 +2008,28 @@ impl DownstreamClient {
 /// Represents the Stratum server instance, which maintains configuration
 /// and manages downstream client connections.
 ///
+/// RAII guard that removes a miner from the connection map when dropped.
+///
+/// Wrapping the per-connection `tokio::spawn` body in this guard ensures cleanup
+/// runs on normal return, panic, and async cancellation — not only on clean exit.
+/// `Drop` is synchronous, so the actual async `remove_peer` call is offloaded to
+/// a detached task; the Arc keeps the mapping alive until the task completes.
+struct ConnectionGuard {
+    peer_addr: String,
+    connection_mapping: Arc<RwLock<ConnectionMapping>>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let peer_addr = self.peer_addr.clone();
+        let mapping = Arc::clone(&self.connection_mapping);
+        tokio::spawn(async move {
+            mapping.write().await.remove_peer(&peer_addr);
+            debug!(peer = %peer_addr, "Miner cleanup complete (ConnectionGuard)");
+        });
+    }
+}
+
 /// # Fields
 /// * `stratum_config` - The configuration settings for the Stratum server.
 /// * `downstream_connection_mapping` - Thread-safe mapping of downstream
@@ -3686,12 +3708,19 @@ impl Server {
                          let global_job_store_clone = Arc::clone(&global_job_store);
                          let peer_addr_string = peer_addr.to_string();
 
-                         let connection_mapping_for_cleanup = Arc::clone(&self.downstream_connection_mapping);
                          let audit_dag_clone = audit_dag.clone();
                          let upstream_share_tx_clone = upstream_share_tx.clone();
                          let upstream_configure_tx_clone = upstream_configure_tx.clone();
 
+                         let _guard = ConnectionGuard {
+                             peer_addr: peer_addr_string.clone(),
+                             connection_mapping: Arc::clone(&self.downstream_connection_mapping),
+                         };
+
                          tokio::spawn(async move{
+                             // _guard is moved into the task. Drop fires on normal return,
+                             // panic, or cancellation — guaranteeing remove_peer always runs.
+                             let _guard = _guard;
                              let _=  Self::handle_connection(downstream_client.clone(),peer_addr,reader,writer,&mut downstream_rx,global_job_store_clone,downstream_tx,notification_sender,swarm_handler_arc_ref,audit_dag_clone,upstream_share_tx_clone,connection_mapping_clone,upstream_configure_tx_clone,control_rx,).await;
                              let counters = {
                                  let c = downstream_client.lock().await;
@@ -3705,24 +3734,6 @@ impl Server {
                                  invalid = counters.invalid,
                                  "miner disconnected"
                              );
-                             debug!(
-                                        connection_id = %connection_id_hex,
-                                        peer = %peer_addr_string,
-                                        "Cleaning up disconnected miner"
-                                    );
-
-                             // cleanup after connection closes, remove from connection mapping
-                             connection_mapping_for_cleanup
-                                     .write()
-                                     .await
-                                     .remove_peer(&peer_addr_string);
-
-                                    debug!(
-                                        connection_id = %connection_id_hex,
-                                        peer = %peer_addr_string,
-                                        "Miner cleanup complete"
-                                    );
-
                                 });
                             }
                             Err(error)=>{

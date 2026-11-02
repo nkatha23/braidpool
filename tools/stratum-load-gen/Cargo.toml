@@ -1,0 +1,20 @@
+[package]
+name = "stratum-load-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Stratum V1 load generator for Braidpool benchmarking"
+
+[[bin]]
+name = "stratum-load-gen"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -28,6 +28,15 @@ pub mod constants {
     pub const MAX_OP_RETURN_DATA: usize = 80;
     pub const MAX_BRAIDPOOL_COMMITMENT_LEN: usize = 72;
     pub const MAX_COINBASE_SCRIPT_SIG: usize = 100;
+
+    /// Conservative ceiling on the total serialized coinbase transaction, in bytes.
+    ///
+    /// Legitimate coinbases are a few kB (EDCA caps payout outputs at 64), so this
+    /// only trips on pathological growth. There is no tight Bitcoin *consensus*
+    /// coinbase limit — the real constraint is per-miner hardware, which v0.1 data
+    /// gathering measures via the per-job size log — so this is intentionally
+    /// generous and will be tightened once real hardware limits are known.
+    pub const MAX_COINBASE_SIZE: usize = 100_000;
     pub const MAX_EXTRANONCE_LEN: usize = 32;
     pub const MAX_BITCOIN_HEIGHT: u32 = 10_000_000;
     pub const MAX_BIP34_HEIGHT_BYTES: usize = 4;
@@ -336,7 +345,31 @@ pub fn build_braidpool_coinbase_from_template(
         input: vec![coinbase_input],
         output: final_outputs,
     };
+
+    // Guard the full coinbase size and log it per job — v0.1 data gathering, so
+    // operators can report the largest coinbase their hardware accepts.
+    let coinbase_size = guard_coinbase_size(&transaction)?;
+    info!(
+        coinbase_size_bytes = coinbase_size,
+        output_count = transaction.output.len(),
+        "Built braidpool coinbase"
+    );
+
     Ok(FinalCoinbase { transaction })
+}
+
+/// Measures the serialized coinbase and rejects it if it exceeds
+/// [`constants::MAX_COINBASE_SIZE`]. Returns the measured size on success so the
+/// caller can log it.
+fn guard_coinbase_size(transaction: &Transaction) -> Result<usize, CoinbaseError> {
+    let size = serialize(transaction).len();
+    if size > constants::MAX_COINBASE_SIZE {
+        return Err(CoinbaseError::CoinbaseTooLarge {
+            size,
+            limit: constants::MAX_COINBASE_SIZE,
+        });
+    }
+    Ok(size)
 }
 
 /// Assembles a complete Bitcoin block by replacing coinbase and updating header
@@ -475,6 +508,37 @@ pub fn create_block_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_coinbase_size_trips_on_pathological_size() {
+        // A normal small coinbase passes and reports its measured size.
+        let small = Transaction {
+            version: Version::non_standard(2),
+            lock_time: LockTime::from_consensus(0),
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert!(guard_coinbase_size(&small).is_ok());
+
+        // ~3200 outputs of ~34 bytes each exceed the 100 kB ceiling → rejected.
+        let big_output = TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: ScriptBuf::from_bytes(vec![0u8; 25]),
+        };
+        let big = Transaction {
+            version: Version::non_standard(2),
+            lock_time: LockTime::from_consensus(0),
+            input: vec![],
+            output: vec![big_output; 3200],
+        };
+        assert!(matches!(
+            guard_coinbase_size(&big),
+            Err(CoinbaseError::CoinbaseTooLarge { .. })
+        ));
+    }
 
     #[test]
     fn test_merkle_root_calculation() {

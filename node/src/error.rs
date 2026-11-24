@@ -528,6 +528,8 @@ pub enum CoinbaseError {
     ConsensusDecodeError,
     InvalidCommitmentLength,
     OpReturnTooLarge,
+    /// The total serialized coinbase exceeded `MAX_COINBASE_SIZE`.
+    CoinbaseTooLarge { size: usize, limit: usize },
     PushBytesError(bitcoin::script::PushBytesError),
     AddressError(AddressParseError),
     TemplateMissingOutputs,
@@ -548,6 +550,10 @@ impl fmt::Display for CoinbaseError {
             CoinbaseError::ConsensusDecodeError => write!(f, "Failed to decode transaction"),
             CoinbaseError::InvalidCommitmentLength => write!(f, "Invalid commitment length"),
             CoinbaseError::OpReturnTooLarge => write!(f, "OP_RETURN data exceeds 80 bytes"),
+            CoinbaseError::CoinbaseTooLarge { size, limit } => write!(
+                f,
+                "coinbase transaction is {size} bytes, exceeding the {limit}-byte limit"
+            ),
             CoinbaseError::PushBytesError(e) => write!(f, "Push bytes error: {}", e),
             CoinbaseError::AddressError(e) => write!(f, "Address error: {}", e),
             CoinbaseError::TemplateMissingOutputs => {

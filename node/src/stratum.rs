@@ -2131,6 +2131,21 @@ impl GlobalJobStore {
         }
     }
 
+    /// Total serialized size, in bytes, of all transactions currently held in
+    /// the store across every retained template.
+    ///
+    /// This is instrumentation for the A2b investigation: it measures the
+    /// residual transaction memory duplicated into the job store (templates are
+    /// shared by `Arc`, but each still owns its own `Vec<Transaction>`). Used to
+    /// confirm whether lazy transaction fetch is worth building at v0.1 scale.
+    pub fn transaction_bytes(&self) -> usize {
+        self.jobs
+            .values()
+            .flat_map(|job| &job.blocktemplate.transactions)
+            .map(|tx| tx.total_size())
+            .sum()
+    }
+
     pub fn clear_upstream_jobs(&mut self) {
         let upstream_template_ids: Vec<TemplateId> = self
             .job_id_to_template
@@ -2185,6 +2200,17 @@ impl GlobalJobStore {
         self.jobs.entry(template_id.clone()).or_insert(job);
         self.job_id_to_template.insert(job_id, template_id);
         self.next_job_id += 1;
+
+        // A2b instrumentation: measure residual transaction memory retained by
+        // the store so we can confirm whether lazy transaction fetch is worth
+        // building at v0.1 scale before committing to it.
+        // TODO: remove after A2b measurement (see docs/job_store_memory_measurement.md).
+        info!(
+            jobs_held = self.jobs.len(),
+            job_store_tx_bytes = self.transaction_bytes(),
+            "job store tx memory"
+        );
+
         job_id
     }
 
@@ -5327,5 +5353,104 @@ mod global_job_store_tests {
                                                              // Template 1 has no remaining job_id, so latest_job_id_for returns None.
         assert_eq!(store.latest_job_id_for(&TemplateId::Braidpool(1)), None);
         assert_eq!(store.latest_job_id_for(&TemplateId::Braidpool(2)), Some(1));
+    }
+
+    // --- A2b residual-memory measurement (Option A, deterministic) ---------
+    //
+    // See docs/job_store_memory_measurement.md. Rather than run a full IPC node
+    // against a mainnet mempool, we seed the store with templates sized like
+    // real near-full blocks and read back what `transaction_bytes()` reports.
+    // This answers the roadmap gate ("does residual memory matter?") with a
+    // reproducible upper bound instead of a live, unrepeatable number.
+
+    /// Build a transaction whose serialized size is dominated by `padding`
+    /// witness bytes, so a template can be padded to a target byte size using
+    /// realistic `Transaction` allocations (not a mock).
+    fn padded_tx(padding: usize) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::non_standard(2),
+            lock_time: bitcoin::absolute::LockTime::from_consensus(0),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: {
+                    let mut w = Witness::new();
+                    w.push(vec![0u8; padding]);
+                    w
+                },
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    /// A template whose transactions sum to at least `target_bytes` of
+    /// serialized data, modelling a block of that size. Transaction *count*
+    /// does not affect the byte total we measure; only aggregate size does.
+    fn template_of_tx_bytes(target_bytes: usize) -> BlockTemplate {
+        // ~500-byte transactions, close to the mainnet average.
+        let unit = padded_tx(450);
+        let unit_size = unit.total_size();
+        let count = target_bytes.div_ceil(unit_size);
+        BlockTemplate {
+            transactions: (0..count).map(|_| unit.clone()).collect(),
+            ..BlockTemplate::default()
+        }
+    }
+
+    fn job_with_template(blocktemplate: BlockTemplate) -> Arc<JobDetails> {
+        Arc::new(JobDetails {
+            blocktemplate,
+            coinbase1: String::new(),
+            coinbase2: String::new(),
+            coinbase_merkle_path: vec![],
+            coinbase_witness_commitment: None,
+            job_sent_time: 0,
+            is_upstream_job: false,
+        })
+    }
+
+    #[test]
+    fn a2b_job_store_memory_measurement() {
+        // A near-full mainnet block carries ~1.8 MB of non-coinbase transaction
+        // data (blocks run ~1.5–2.0 MB serialized).
+        const FULL_BLOCK_TX_BYTES: usize = 1_800_000;
+        let capacity = crate::GLOBAL_JOB_STORE_CAPACITY;
+
+        let per_template = template_of_tx_bytes(FULL_BLOCK_TX_BYTES)
+            .transactions
+            .iter()
+            .map(|tx| tx.total_size())
+            .sum::<usize>();
+
+        // Worst case: `capacity` *distinct* templates, each a full block. The
+        // store owns a separate `Vec<Transaction>` per template (templates are
+        // Arc-shared across job_ids, but their transaction vectors are not
+        // deduplicated), so all of this is resident at once.
+        let mut store = GlobalJobStore::new(capacity);
+        for i in 0..capacity as u64 {
+            let template = template_of_tx_bytes(FULL_BLOCK_TX_BYTES);
+            store.insert(TemplateId::Braidpool(i + 1), job_with_template(template));
+        }
+
+        let steady = store.transaction_bytes();
+        let mb = |b: usize| b as f64 / 1_048_576.0;
+        println!(
+            "A2b residual-memory measurement:\n  \
+             per full-block template : {per_template} bytes ({:.2} MB)\n  \
+             store capacity          : {capacity} templates\n  \
+             steady-state tx memory  : {steady} bytes ({:.2} MB)",
+            mb(per_template),
+            mb(steady),
+        );
+
+        // Upper bound: capacity distinct full blocks held simultaneously. Real
+        // deployments hold less, because consecutive templates share a
+        // TemplateId (Arc reuse) so `jobs_held` sits below capacity.
+        assert_eq!(store.transaction_bytes(), per_template * capacity);
+        assert!(steady > 0);
     }
 }

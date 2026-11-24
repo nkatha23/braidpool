@@ -53,13 +53,25 @@ templates sized like real near-full blocks (~1.8 MB of transactions each),
 fills it to the capacity-20 ceiling, and reads back `transaction_bytes()`. It
 needs no node, no mempool, and reruns anywhere.
 
-Run it:
+### Run it (step by step)
 
 ```bash
+# 1. from the repo root, enter the node crate
+cd node
+
+# 2. run the measurement test, showing its printed output
 cargo test --lib a2b_job_store_memory_measurement -- --nocapture
+
+# 3. (optional) keep a raw capture outside the repo
+cargo test --lib a2b_job_store_memory_measurement -- --nocapture 2>&1 \
+  | tee ~/a2b-measurement-$(date +%Y%m%d).log
 ```
 
-### Result (measured)
+The test prints a three-line block (`per full-block template`, `store
+capacity`, `steady-state tx memory`). The canonical record is the dated
+"Result" block below — paste each run there so the history lives with the doc.
+
+### Result (measured 2026-11-24)
 
 ```
 per full-block template : 1800324 bytes (1.72 MB)
